@@ -1,5 +1,4 @@
 import queue
-import datetime
 import xml.etree.cElementTree as ET
 from xml.dom import minidom
 import networkit as nt
@@ -41,7 +40,7 @@ class GEXFReader:
 			_id = n.getAttribute("id")
 			if self.dynamic:
 				self.mapping[_id] = int(_id)
-				self.handleDynamics(n, "n", _id, "0", "0")
+				self.parseDynamics(n, "n", _id, "0", "0")
 			else:
 				self.mapping[_id] = self.nInitialNodes
 				self.nInitialNodes +=1
@@ -59,7 +58,7 @@ class GEXFReader:
 				self.weighted = True
 				w = e.getAttribute("weight")
 			if self.dynamic:
-				self.handleDynamics(e, "e", u, v, w)
+				self.parseDynamics(e, "e", u, v, w)
 			else:
 				self.q.put((u, v, w))
 
@@ -75,18 +74,21 @@ class GEXFReader:
 			(u, v, w) = (edge[0], edge[1], float(edge[2]))
 			self.g.addEdge(self.mapping[u], self.mapping[v], w)
 
-		#5.2 Sorting th eventStream by time and adding timesteps between events that happen in different times
+		#5.2 Sorting the eventStream by time and adding timesteps between events that happen in different times
 		self.eventStream.sort(key=lambda x:x[1])
 		for i in range(1, len(self.eventStream)):
 			if self.eventStream[i][1] != self.eventStream[i-1][1]:
 				self.eventStream.append((nt.dynamic.GraphEvent(nt.dynamic.GraphEvent.TIME_STEP, 0, 0, 0), self.eventStream[i-1][1] ))
 		self.eventStream.sort(key=lambda x:x[1])
 		self.eventStream = [event[0] for event in self.eventStream]
-
 		return (self.g, self.eventStream)
 
-
 	def createEvent(self, eventTime, eventType, u, v, w):
+		"""
+			 Creates a NetworKit::event from the supplied parameters
+			 and passes it to eventStream
+
+		"""
 		(event, u, v, w) = (" ", self.mapping[u], self.mapping[v], float(w))
 		if eventType == "an":
 			event = nt.dynamic.GraphEvent(nt.dynamic.GraphEvent.NODE_ADDITION, u, v, w)
@@ -100,16 +102,18 @@ class GEXFReader:
 			event = nt.dynamic.GraphEvent(nt.dynamic.GraphEvent.EDGE_REMOVAL, u, v, w)
 		self.eventStream.append((event, eventTime))
 
-
-	def handleDynamics(self, element, elementType, u, v, w):
+	def parseDynamics(self, element, elementType, u, v, w):
 		"""
 			Determine the operations as follows:
 			1.Element has start:Create add event
 			2.Element has end:Create del event
 			3.If element has only end or no start&end, add it to the initial graph
 			4.If an element is added after it's deleted, use restoreNode
-		"""
 
+			!NOTE: A dynamic element must be defined either using only spells
+			or inline attributes. These 2 shouldn't be mixed.
+
+		"""
 		mapped, deleted, added = False, False, False
 		#parser for dynamic elements that are defined with spell attributes
 		if element.hasChildNodes():
@@ -161,9 +165,9 @@ class GEXFReader:
 
 	def mapDynamicNodes(self):
 		"""
-		Node id of a dynamic node must be determined before it's mapped to its gexf id.
-		This requires processing the sorted eventStream and figuring out the addition order
-		of the nodes.
+			Node id of a dynamic node must be determined before it's mapped to its gexf id.
+			This requires processing the sorted eventStream and figuring out the addition order
+			of the nodes.
 
 		"""
 		self.eventStream.sort(key=lambda x:x[1])
@@ -252,7 +256,6 @@ class GEXFWriter:
 		#5. Write the generated tree to the file
 		tree = ET.ElementTree(root)
 		tree.write(fname,"utf-8",True)
-
 
 	def writeEvent(self, xmlElement, eventStream, graphElement):
 		"""
