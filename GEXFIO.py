@@ -1,7 +1,8 @@
 import queue
 import xml.etree.cElementTree as ET
 from xml.dom import minidom
-import networkit as nt
+from _NetworKit import Graph, GraphEvent
+from random import randint
 
 
 # GEXF Reader
@@ -9,44 +10,58 @@ class GEXFReader:
 	def __init__(self):
 		""" Initializes the GEXFReader class """
 		self.mapping = dict()
-		self.g = nt.Graph(0)
+		self.g = Graph(0)
 		self.weighted = False
 		self.directed = False
 		self.dynamic = False
+		self.hasDynamicWeights = False
 		self.q = queue.Queue()
 		self.eventStream = []
 		self.nInitialNodes = 0
+		self.ctr = 0
+		self.timeFormat = ""
 
 	def read(self, fpath):
-		"""Reads and returns the graph object defined in fpath"""
+		""" Reads and returns the graph object defined in fpath """
 		#0. Reset internal vars and parse the xml
-		self.mapping.clear()
-		self.g = nt.Graph(0)
-		self.weighted, self.directed, self.dynamic = False, False, False
-		self.eventStream.clear()
-		self.nInitialNodes = 0
+		self.__init__()
 		doc = minidom.parse(fpath)
 
-		#1. Determine if graph is dynamic and directed
+		#1. Determine if graph is dynamic, directed and has dynamically changing weights
 		graph = doc.getElementsByTagName("graph")[0]
 		if (graph.getAttribute("defaultedgetype") == "directed"):
 			self.directed = True
 		if (graph.getAttribute("mode") == "dynamic"):
 			self.dynamic = True
+		if self.dynamic:
+			self.timeFormat = graph.getAttribute("timeformat")
+		attributes = graph.getElementsByTagName("attribute")
+		for att in attributes:
+			if att.getAttribute("id") == "weight":
+				self.hasDynamicWeights = True
+				self.weighted = True
 
-		#2. Read nodes and map them to their id's defined in the file
+		#2. Read nodes and map them to IDs defined in GEXF file
 		nodes = doc.getElementsByTagName("node")
 		for n in nodes:
-			_id = n.getAttribute("id")
+			u = n.getAttribute("id")
 			if self.dynamic:
-				self.mapping[_id] = int(_id)
-				self.parseDynamics(n, "n", _id, "0", "0")
+				# 2-way mapping to refer nodes back in mapDynamicNodes() method
+				self.mapping[u] = self.ctr
+				self.mapping[self.ctr] = u
+				controlList = {'elementAdded': False, 'elementDeleted': False}
+				spells = n.getElementsByTagName("spell")
+				if len(spells) > 0:
+					for s in spells:
+						self.parseDynamics(s, "n", controlList, u)
+				else:
+					self.parseDynamics(n, "n", controlList, u)
+				self.ctr += 1
 			else:
-				self.mapping[_id] = self.nInitialNodes
+				self.mapping[u] = self.nInitialNodes
 				self.nInitialNodes +=1
 		if self.dynamic:
 			self.mapDynamicNodes()
-
 
 		#3.Read edges and determine if graph is weighted
 		edges = doc.getElementsByTagName("edge")
@@ -58,131 +73,170 @@ class GEXFReader:
 				self.weighted = True
 				w = e.getAttribute("weight")
 			if self.dynamic:
-				self.parseDynamics(e, "e", u, v, w)
+				controlList = {'elementAdded': False, 'elementDeleted': False}
+				spells = e.getElementsByTagName("spell")
+				if len(spells) > 0:
+					for s in spells:
+						self.parseDynamics(s, "e", controlList, u, v, w)
+				else:
+					self.parseDynamics(e, "e", controlList, u, v, w)
 			else:
 				self.q.put((u, v, w))
 
 		#4. Create graph object
-		self.g = nt.Graph(0, self.weighted, self.directed)
+		self.g = Graph(self.nInitialNodes, self.weighted, self.directed)
 
-		#5. Add initial edges and nodes to the graph and sort the eventStream by time
-		#5.1 Adding initial edges and nodes
-		for i in range(0, self.nInitialNodes):
-			self.g.addNode()
+		#5. Add initial edges to the graph and sort the eventStream by time
+		#5.1 Adding initial edges
 		while not self.q.empty():
 			edge = self.q.get()
 			(u, v, w) = (edge[0], edge[1], float(edge[2]))
 			self.g.addEdge(self.mapping[u], self.mapping[v], w)
 
-		#5.2 Sorting the eventStream by time and adding timesteps between events that happen in different times
+		#5.2 Sorting the eventStream by time and adding timeStep between events that happen in different times
 		self.eventStream.sort(key=lambda x:x[1])
 		for i in range(1, len(self.eventStream)):
 			if self.eventStream[i][1] != self.eventStream[i-1][1]:
-				self.eventStream.append((nt.dynamic.GraphEvent(nt.dynamic.GraphEvent.TIME_STEP, 0, 0, 0), self.eventStream[i-1][1] ))
+				self.eventStream.append((GraphEvent(GraphEvent.TIME_STEP, 0, 0, 0), self.eventStream[i-1][1]))
 		self.eventStream.sort(key=lambda x:x[1])
 		self.eventStream = [event[0] for event in self.eventStream]
 		return (self.g, self.eventStream)
 
-	def createEvent(self, eventTime, eventType, u, v, w):
-		"""
-			 Creates a NetworKit::event from the supplied parameters
-			 and passes it to eventStream
 
-		"""
-		(event, u, v, w) = (" ", self.mapping[u], self.mapping[v], float(w))
-		if eventType == "an":
-			event = nt.dynamic.GraphEvent(nt.dynamic.GraphEvent.NODE_ADDITION, u, v, w)
-		elif eventType == "dn":
-			event = nt.dynamic.GraphEvent(nt.dynamic.GraphEvent.NODE_REMOVAL, u, v, w)
-		elif eventType == "rn":
-			event = nt.dynamic.GraphEvent(nt.dynamic.GraphEvent.NODE_RESTORATION, u, v, w)
-		elif eventType == "ae":
-			event = nt.dynamic.GraphEvent(nt.dynamic.GraphEvent.EDGE_ADDITION, u, v, w)
-		elif eventType == "de":
-			event = nt.dynamic.GraphEvent(nt.dynamic.GraphEvent.EDGE_REMOVAL, u, v, w)
-		self.eventStream.append((event, eventTime))
-
-	def parseDynamics(self, element, elementType, u, v, w):
+	def parseDynamics(self, element, elementType, controlList,  u,  v = "0", w = "0"):
 		"""
 			Determine the operations as follows:
-			1.Element has start:Create add event
-			2.Element has end:Create del event
-			3.If element has only end or no start&end, add it to the initial graph
-			4.If an element is added after it's deleted, use restoreNode
+			1.Element has start and not deleted before: Create add event
+			2.Element has start and deleted before: Create restore event
+			3.Element has end:Create del event
+			4.If an element has end before start(or no start at all), add it to the initial graph
+			5.For dynamic edges, simply go over the attvalues and create
+			weight update events
 
-			!NOTE: A dynamic element must be defined either using only spells
+			* A dynamic element must be defined either using only spells
 			or inline attributes. These 2 shouldn't be mixed.
+			(For example, Gephi will treat them differently. It'll ignore the inline declaration
+			if the same element also contains spells)
 
 		"""
-		mapped, deleted, added = False, False, False
-		#parser for dynamic elements that are defined with spell attributes
-		if element.hasChildNodes():
-			spells = element.getElementsByTagName("spell")
-			for s in spells:
-				if s.hasAttribute("start"):
-					if not deleted:
-						self.createEvent(s.getAttribute("start"), "a"+elementType, u, v, w)
-					else:
-						#readding a deleted node requires restoration(to keep ids consistent during the lifetime of the graph)
-						self.createEvent(s.getAttribute("start"), "r"+elementType, u, v, w)
-					if s.hasAttribute("end"):
-						self.createEvent(s.getAttribute("end"), "d"+elementType, u, v, w)
-						deleted = True
-				else:
-					if (elementType == "n" and not mapped):
-						self.mapping[u] = self.nInitialNodes
-						self.nInitialNodes += 1
-						mapped = True
-					elif (elementType == "e" and not added):
-						self.q.put((u,v,w))
-						added = True
-					if s.hasAttribute("end"):
-						self.createEvent(s.getAttribute("end"), "d"+elementType, u, v, w)
-						deleted = True
-		#parser for dynamic elements that are defined with inline attributes
-		else:
-			if element.hasAttribute("start"):
-				if not deleted:
-					self.createEvent(element.getAttribute("start"), "a"+elementType, u, v, w)
-				else:
-					#readding a deleted node requires restoration(to keep ids consistent during the lifetime of the graph)
-					self.createEvent(element.getAttribute("start"), "r"+elementType, u, v, w)
-				if element.hasAttribute("end"):
-					self.createEvent(element.getAttribute("end"), "d"+elementType, u, v, w)
-					deleted = True
+		startTime = element.getAttribute("start")
+		if startTime == "":
+			startTime = element.getAttribute("startopen")
+		endTime	= element.getAttribute("end")
+		if endTime == "":
+			endTime	= element.getAttribute("endopen")
+		if self.timeFormat != "date":
+			try:
+				startTime = float(startTime)
+			except:
+				pass
+			try:
+				endTime = float(endTime)
+			except:
+				pass
+
+		if startTime != "" and endTime != "":
+			if startTime < endTime and not controlList['elementDeleted']:
+				self.createEvent(startTime, "a"+elementType, u, v, w)
+				controlList['elementAdded'] = True
 			else:
-				if (elementType == "n" and not mapped):
-					self.mapping[u] = self.nInitialNodes
+				self.createEvent(startTime, "r"+elementType, u, v, w)
+			self.createEvent(endTime, "d"+elementType, u, v, w)
+			controlList['elementDeleted'] = True
+
+		if startTime != "" and endTime == "":
+			if controlList['elementDeleted']:
+				self.createEvent(startTime, "r"+elementType, u, v, w)
+			else:
+				self.createEvent(startTime, "a"+elementType, u, v, w)
+				controlList['elementAdded'] = True
+
+	 	# Handle dynamic edge weights here
+		if elementType == "e" and self.hasDynamicWeights:
+			attvalues = element.getElementsByTagName("attvalue")
+			# If a spell is traversed, attvalues are siblings
+			# Trying getting siblings attvalues returned nothing at this point
+			if len(attvalues) == 0:
+				attvalues = element.parentNode.parentNode.getElementsByTagName("attvalue")
+			for att in attvalues:
+				if att.getAttribute("for") == "weight":
+					w = att.getAttribute("value")
+					startTime = att.getAttribute("start")
+					if startTime == "":
+						startTime = att.getAttribute("startopen")
+					if self.timeFormat != "date":
+						startTime = float(startTime)	
+					# If this edge is not added, first weight update
+					#indicates edge addition
+					if not controlList['elementAdded']:
+						self.createEvent(startTime, "a"+elementType, u, v, w)
+						controlList['elementAdded'] = True
+					else:
+						self.createEvent(startTime, "c"+elementType, u, v, w)
+
+		if startTime == "":
+			if not controlList['elementAdded']:
+				if elementType == "n":
+					self.mapping[u] = self.ctr
 					self.nInitialNodes += 1
-					print(self.nInitialNodes)
-					mapped = True
-				elif (elementType == "e" and not added):
+				else:
 					self.q.put((u,v,w))
-					added = True
-				if element.hasAttribute("end"):
-					self.createEvent(element.getAttribute("end"), "d"+elementType, u, v, w)
-					deleted = True
+				controlList['elementAdded'] = True
+			if endTime != "":
+				self.createEvent(endTime, "d"+elementType, u, v, w)
+				controlList['elementDeleted'] = True
+
+	def createEvent(self, eventTime, eventType, u, v, w):
+		"""
+			 Creates a NetworKit::GraphEvent from the supplied parameters
+			 and passes it to eventStream
+		"""
+		event, u = None, self.mapping[u]
+		if eventType[1] == "e":
+			v, w = self.mapping[v], float(w)
+		if eventType == "an":
+			event = GraphEvent(GraphEvent.NODE_ADDITION, u, 0, 0)
+		elif eventType == "dn":
+			event = GraphEvent(GraphEvent.NODE_REMOVAL, u, 0, 0)
+		elif eventType == "rn":
+			event = GraphEvent(GraphEvent.NODE_RESTORATION, u, 0, 0)
+		elif eventType == "ae" or eventType == "re":
+			event = GraphEvent(GraphEvent.EDGE_ADDITION, u, v, w)
+		elif eventType == "de":
+			event = GraphEvent(GraphEvent.EDGE_REMOVAL, u, v, w)
+		elif eventType == "ce":
+			event = GraphEvent(GraphEvent.EDGE_WEIGHT_UPDATE, u, v, w)
+		self.eventStream.append((event, eventTime))
 
 	def mapDynamicNodes(self):
 		"""
-			Node id of a dynamic node must be determined before it's mapped to its gexf id.
-			This requires processing the sorted eventStream and figuring out the addition order
-			of the nodes.
+			Node ID of a dynamic node must be determined before it's mapped to its GEXF ID.
+			This requires processing the sorted eventStream and figuring out the addition order of the nodes.
+			After that, node addition/deletion/restoration operations of this node must be readded to eventStream
+			with correct mapping.
 
+			!Note: New mapping of a node can be equal to old mapping of a node. In order to prevent collisions,
+			isMapped array must be maintained and controlled.
 		"""
-		self.eventStream.sort(key=lambda x:x[1])
 		nNodes = self.nInitialNodes
-		for i in range(len(self.eventStream)):
+		nEvent = len(self.eventStream)
+		isMapped = [False] * nEvent
+		self.eventStream.sort(key=lambda x:x[1])
+		for i in range(0, nEvent):
 			event = self.eventStream[i]
-			if event[0].type == 0:
-				_id = str(event[0].u)
-				self.mapping[_id] = nNodes
-				#reconstruct the event once the correct node id is determined
-				mappedEvent = nt.dynamic.GraphEvent(nt.dynamic.GraphEvent.NODE_ADDITION, nNodes, 0, 0)
-				self.eventStream[i] = (mappedEvent, event[1])
-				nNodes += 1
-
-
+			#Only the nodes with addition event will get remapped.
+			if not isMapped[i] and event[0].type == GraphEvent.NODE_ADDITION:
+				u = event[0].u
+				self.mapping[self.mapping[u]] = nNodes
+				#All the other events of that node comes after it's addition event
+				for j in range(i, len(self.eventStream)):
+					event = self.eventStream[j]
+					if not isMapped[j] and event[0].u == u:
+						mappedEvent = GraphEvent(event[0].type, self.mapping[self.mapping[u]], 0, 0)
+						self.eventStream[j] = (mappedEvent, event[1])
+						isMapped[j] = True
+				nNodes +=1
+				isMapped[i] = True
 
 # GEXFWriter
 class GEXFWriter:
@@ -193,22 +247,24 @@ class GEXFWriter:
 		""" Initializes the class. """
 		self.edgeIdctr = 0
 		self.q = queue.Queue()
+		self.hasDynamicWeight = False
 
-	def write(self, graph, fname, eventStream = None):
+	def write(self, graph, fname, eventStream = []):
 		"""
-			Writes a NetworKit graph to the specified file fname.
+			Writes a NetworKit::Graph to the specified file fname.
 			Parameters:
 				- graph: a NetworKit::Graph python object
 				- fname: the desired file path and name to be written to
-
+				- eventStream: stream of events
 		"""
-		#0. reset some internal variables in case more graphs are written with the same instance
-		self.edgeIdctr = 0
+		#0. reset internal variables in case more graphs are written with the same instance
+		self.__init__()
 
 		#1. start with the root element and the right header information
 		root = ET.Element('gexf')
 		root.set("xmlns:xsi","http://www.w3.org/2001/XMLSchema-instance")
 		root.set("xsi:schemaLocation","http://www.gexf.net/1.2draft http://www.gexf.net/1.2draft/gexf.xsd")
+		root.set('version', '1.2')
 
 		#2. create graph element with appropriate information
 		graphElement = ET.SubElement(root,"graph")
@@ -216,18 +272,32 @@ class GEXFWriter:
 			graphElement.set('defaultedgetype', 'directed')
 		else:
 			graphElement.set('defaultedgetype', 'undirected')
-		if eventStream != None:
+		if len(eventStream) > 0:
 			graphElement.set('mode', 'dynamic')
 			graphElement.set('timeformat', 'double')
+			for event in eventStream:
+				if event.type == GraphEvent.EDGE_WEIGHT_UPDATE:
+					dynamicAtt = ET.SubElement(graphElement, "attributes")
+					dynamicAtt.set('class', 'edge')
+					dynamicAtt.set('mode', 'dynamic')
+					dynamicWeight = ET.SubElement(dynamicAtt, "attribute")
+					dynamicWeight.set('id', 'weight')
+					dynamicWeight.set('title', 'Weight')
+					dynamicWeight.set('type', 'float')
+					self.hasDynamicWeight = True
+					break
+		else:
+			graphElement.set('mode', 'static')
 
 		#3. Add nodes
 		nodesElement = ET.SubElement(graphElement, "nodes")
-		nDynamicNodes = 0 #indicates number of nodes added after graph is initialized
-		if eventStream != None:
-			for event in eventStream:
-				if event.type == 0:
-					nDynamicNodes +=1
-		nNodes = len(graph.nodes()) + nDynamicNodes
+		nNodes = 0
+		#3.1 count the # of nodes (inital + dynamic nodes)
+		for event in eventStream:
+			if event.type == GraphEvent.NODE_ADDITION:
+				nNodes +=1
+		nNodes += len(graph.nodes())
+		#3.2 Write nodes to the gexf file
 		for n in range(nNodes):
 			nodeElement = ET.SubElement(nodesElement,'node')
 			nodeElement.set('id', str(n))
@@ -237,7 +307,7 @@ class GEXFWriter:
 		edgesElement = ET.SubElement(graphElement, "edges")
 		#4.1 Put all edges into a queue(inital + dynamic edges)
 		for e in graph.edges():
-			self.q.put(e)
+			self.q.put((e[0], e[1], graph.weight(e[0], e[1])))
 		for event in eventStream:
 			if event.type == 2:#edge addition event
 				self.q.put((event.u, event.v, event.w))
@@ -250,7 +320,7 @@ class GEXFWriter:
 			edgeElement.set('id', "{0}".format(self.edgeIdctr))
 			self.edgeIdctr += 1
 			if graph.isWeighted():
-				edgeElement.set('weight', str(graph.weight(e[2])))
+				edgeElement.set('weight', str(e[2]))
 			self.writeEvent(edgeElement, eventStream, e)
 
 		#5. Write the generated tree to the file
@@ -258,30 +328,41 @@ class GEXFWriter:
 		tree.write(fname,"utf-8",True)
 
 	def writeEvent(self, xmlElement, eventStream, graphElement):
-		"""
-			Determine the correct tag(start/end) as follows:
-			ADDITION, RESTORATION : start
-			DELETION : end
-
-		"""
-		matched = False #a var that indicates if the event belongs the graph element we traverse on
-		tagged, spellsElement, timeSteps = False, None, 0
-		startEvents = [0, 2, 6] #add node/edge and restore node events
-		endEvents = [1, 3] #delete node/edge events
+		#a var that indicates if the event belongs the graph element we traverse on
+		matched = False
+		startEvents = [GraphEvent.NODE_ADDITION, GraphEvent.EDGE_ADDITION, GraphEvent.NODE_RESTORATION]
+		endEvents = [GraphEvent.NODE_REMOVAL, GraphEvent.EDGE_REMOVAL]
+		nodeEvents = [GraphEvent.NODE_ADDITION, GraphEvent.NODE_REMOVAL, GraphEvent.NODE_RESTORATION]
+		edgeEvents = [GraphEvent.EDGE_ADDITION, GraphEvent.EDGE_REMOVAL, GraphEvent.EDGE_WEIGHT_UPDATE]
+		spellTag, weightTag, operation = False, False, ""
+		timeStep = 0
+		spellsElement, attValuesElement = None, None
 
 		for event in eventStream:
-			if event.type == 5: #timestep event
-				timeSteps += 1
+			if event.type == GraphEvent.TIME_STEP:
+				timeStep += 1
 			if type(graphElement) == type(0): #a node is an integer
-				matched = (event.type in [0, 1, 6] and event.u == graphElement)
+				matched = (event.type in nodeEvents and event.u == graphElement)
 			else:
-				matched = (event.type in [2, 3] and (event.u == graphElement[0] and event.v == graphElement[1]))
+				matched = (event.type in edgeEvents and (event.u == graphElement[0] and event.v == graphElement[1]))
 			if matched:
-				if not tagged:
-					spellsElement = ET.SubElement(xmlElement, "spells")
-					tagged = True
-				spellElement = ET.SubElement(spellsElement, "spell")
-				if event.type in startEvents:
-					spellElement.set("start", str(timeSteps))
-				if event.type in endEvents:
-					spellElement.set("end", str(timeSteps))
+				#handle weight update seperately
+				if event.type == GraphEvent.EDGE_WEIGHT_UPDATE:
+					if not weightTag:
+						attvaluesElement = ET.SubElement(xmlElement, "attvalues")
+						weightTag = True
+					attvalue = ET.SubElement(attvaluesElement, "attvalue")
+					attvalue.set('for', 'weight')
+					attvalue.set('value', str(event.w))
+					attvalue.set('start', str(timeStep))
+					attvalue.set('endopen', str(timeStep + 1))
+				else:
+					if event.type in startEvents:
+						operation = "start"
+					else:
+						operation = "end"
+					if not spellTag:
+						spellsElement = ET.SubElement(xmlElement, "spells")
+						spellTag = True
+					spellElement = ET.SubElement(spellsElement, "spell")
+					spellElement.set(operation, str(timeStep))
