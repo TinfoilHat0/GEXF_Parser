@@ -2,8 +2,6 @@ import queue
 import xml.etree.cElementTree as ET
 from xml.dom import minidom
 from _NetworKit import Graph, GraphEvent
-from random import randint
-
 
 # GEXF Reader
 class GEXFReader:
@@ -63,7 +61,7 @@ class GEXFReader:
 		if self.dynamic:
 			self.mapDynamicNodes()
 
-		#3.Read edges and determine if graph is weighted
+		#3. Read edges and determine if graph is weighted
 		edges = doc.getElementsByTagName("edge")
 		for e in edges:
 			u = e.getAttribute("source")
@@ -155,7 +153,6 @@ class GEXFReader:
 		if elementType == "e" and self.hasDynamicWeights:
 			attvalues = element.getElementsByTagName("attvalue")
 			# If a spell is traversed, attvalues are siblings
-			# Trying getting siblings attvalues returned nothing at this point
 			if len(attvalues) == 0:
 				attvalues = element.parentNode.parentNode.getElementsByTagName("attvalue")
 			for att in attvalues:
@@ -165,9 +162,8 @@ class GEXFReader:
 					if startTime == "":
 						startTime = att.getAttribute("startopen")
 					if self.timeFormat != "date":
-						startTime = float(startTime)	
-					# If this edge is not added, first weight update
-					#indicates edge addition
+						startTime = float(startTime)
+					# If this edge is not added, first weight update indicates edge addition
 					if not controlList['elementAdded']:
 						self.createEvent(startTime, "a"+elementType, u, v, w)
 						controlList['elementAdded'] = True
@@ -224,11 +220,11 @@ class GEXFReader:
 		self.eventStream.sort(key=lambda x:x[1])
 		for i in range(0, nEvent):
 			event = self.eventStream[i]
-			#Only the nodes with addition event will get remapped.
+			# Only the nodes with addition event will get remapped.
 			if not isMapped[i] and event[0].type == GraphEvent.NODE_ADDITION:
 				u = event[0].u
 				self.mapping[self.mapping[u]] = nNodes
-				#All the other events of that node comes after it's addition event
+				# All the other events of that node comes after it's addition event
 				for j in range(i, len(self.eventStream)):
 					event = self.eventStream[j]
 					if not isMapped[j] and event[0].u == u:
@@ -257,16 +253,16 @@ class GEXFWriter:
 				- fname: the desired file path and name to be written to
 				- eventStream: stream of events
 		"""
-		#0. reset internal variables in case more graphs are written with the same instance
+		#0. Reset internal vars
 		self.__init__()
 
-		#1. start with the root element and the right header information
+		#1. Start with the root element and the right header information
 		root = ET.Element('gexf')
 		root.set("xmlns:xsi","http://www.w3.org/2001/XMLSchema-instance")
 		root.set("xsi:schemaLocation","http://www.gexf.net/1.2draft http://www.gexf.net/1.2draft/gexf.xsd")
 		root.set('version', '1.2')
 
-		#2. create graph element with appropriate information
+		#2. Create graph element with appropriate information
 		graphElement = ET.SubElement(root,"graph")
 		if graph.isDirected():
 			graphElement.set('defaultedgetype', 'directed')
@@ -292,7 +288,7 @@ class GEXFWriter:
 		#3. Add nodes
 		nodesElement = ET.SubElement(graphElement, "nodes")
 		nNodes = 0
-		#3.1 count the # of nodes (inital + dynamic nodes)
+		#3.1 Count the # of nodes (inital + dynamic nodes)
 		for event in eventStream:
 			if event.type == GraphEvent.NODE_ADDITION:
 				nNodes +=1
@@ -309,7 +305,7 @@ class GEXFWriter:
 		for e in graph.edges():
 			self.q.put((e[0], e[1], graph.weight(e[0], e[1])))
 		for event in eventStream:
-			if event.type == 2:#edge addition event
+			if event.type == GraphEvent.EDGE_ADDITION:
 				self.q.put((event.u, event.v, event.w))
 		#4.2 Write edges to the gexf file
 		while not self.q.empty():
@@ -328,7 +324,7 @@ class GEXFWriter:
 		tree.write(fname,"utf-8",True)
 
 	def writeEvent(self, xmlElement, eventStream, graphElement):
-		#a var that indicates if the event belongs the graph element we traverse on
+		# A var that indicates if the event belongs the graph element we traverse on
 		matched = False
 		startEvents = [GraphEvent.NODE_ADDITION, GraphEvent.EDGE_ADDITION, GraphEvent.NODE_RESTORATION]
 		endEvents = [GraphEvent.NODE_REMOVAL, GraphEvent.EDGE_REMOVAL]
@@ -346,7 +342,7 @@ class GEXFWriter:
 			else:
 				matched = (event.type in edgeEvents and (event.u == graphElement[0] and event.v == graphElement[1]))
 			if matched:
-				#handle weight update seperately
+				# Handle weight update seperately
 				if event.type == GraphEvent.EDGE_WEIGHT_UPDATE:
 					if not weightTag:
 						attvaluesElement = ET.SubElement(xmlElement, "attvalues")
